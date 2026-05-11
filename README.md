@@ -183,6 +183,10 @@ This reduces per-NVT timeout from the default 1800 seconds to 120 seconds, cutti
 
 -----
 
+## Legal
+
+Netscan is provided for use on networks and systems you own or have explicit written permission to scan. Unauthorised scanning may be illegal in your jurisdiction. This tool is provided as-is with no warranty. The authors and contributors accept no liability for any damages, legal consequences, or misuse arising from its use.		
+
 ## Licence
 
 MIT — do what you like with it, just don’t point it at networks you don’t own.
