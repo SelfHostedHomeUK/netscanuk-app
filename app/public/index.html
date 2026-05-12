@@ -160,7 +160,7 @@
       <div class="scan-hero">
         <p class="scan-eyebrow">Network Security Analysis</p>
         <h1 class="scan-title">Scan. Analyse.<br><em>Understand.</em></h1>
-        <p class="scan-desc">OpenVAS-powered network scanning with AI interpretation. Enter a target IP address or range to receive a prioritised vulnerability report in plain English.</p>
+        <p class="scan-desc">nmap-powered home network scanning with AI interpretation. Enter a target IP address or range to receive a prioritised vulnerability report in plain English.</p>
       </div>
       <div class="input-group">
         <label class="input-label" for="target-input">Target</label>
@@ -172,7 +172,7 @@
       </div>
       <div class="timing-notice">
         <span class="timing-icon">⏱</span>
-        <span class="timing-text"><strong>A thorough scan takes 30–45 minutes.</strong> That's not a bug — OpenVAS runs 176,000+ vulnerability tests against every open port it finds. Start a scan, close this tab if you like, and come back when you're ready. Your scan will still be running.</span>
+        <span class="timing-text"><strong>A thorough scan takes 2–5 minutes.</strong> nmap scans your network quickly and thoroughly using industry-standard scripts. Start a scan, close this tab if you like, and come back when you're ready. Your scan will still be running.</span>
       </div>
       <div class="warning-box">
         <span class="warning-icon">⚠</span>
@@ -192,7 +192,7 @@
       <p class="scanning-title" id="scanning-title">Scanning Network</p>
       <p class="scanning-target" id="scan-target-display"></p>
       <div class="phase-indicator">
-        <div class="phase active" id="phase-scan">① OpenVAS Scan</div>
+        <div class="phase active" id="phase-scan">① Nmap Scan</div>
         <div class="phase" id="phase-ai">② AI Analysis</div>
         <div class="phase" id="phase-done">③ Report Ready</div>
       </div>
@@ -200,9 +200,9 @@
         <div class="progress-bar-fill" id="progress-fill"></div>
       </div>
       <p class="scanning-status" id="scan-status-text">Initialising scanner...</p>
-      <p class="scanning-hint" id="scanning-hint"><strong>This scan typically takes 30–45 minutes.</strong><br>You can safely close this tab and return later — your scan will still be running.</p>
+      <p class="scanning-hint" id="scanning-hint"><strong>This scan typically takes 2–5 minutes.</strong><br>You can safely close this tab and return later — your scan will still be running.</p>
       <div class="scanning-log" id="scan-log">
-        <div class="log-line">[ SYS ] Connecting to OpenVAS engine...</div>
+        <div class="log-line">[ SYS ] Initialising nmap scanner...</div>
       </div>
     </div>
 
@@ -269,13 +269,13 @@
         ps.className='phase active';pa.className='phase';pd.className='phase';
         sweep.classList.remove('paused');dot.classList.remove('pulsing');fill.classList.remove('ai-phase');
         title.textContent='Scanning Network';
-        hint.innerHTML='<strong>This scan typically takes 30–45 minutes.</strong><br>You can safely close this tab and return later — your scan will still be running.';
+        hint.innerHTML='<strong>This scan typically takes 2–5 minutes.</strong><br>You can safely close this tab and return later — your scan will still be running.';
       } else if(phase==='ai'){
         ps.className='phase done';pa.className='phase active';pd.className='phase';
         sweep.classList.add('paused');dot.classList.add('pulsing');fill.classList.add('ai-phase');
         fill.style.width='100%';
         title.textContent='Running AI Analysis';
-        hint.innerHTML='<strong>OpenVAS scan complete.</strong><br>Claude is now analysing the findings. This usually takes under a minute.';
+        hint.innerHTML='<strong>Nmap scan complete.</strong><br>Claude is now analysing the findings. This usually takes under a minute.';
       } else if(phase==='done'){
         ps.className='phase done';pa.className='phase done';pd.className='phase active';
       }
@@ -296,7 +296,7 @@
 
     let pollInterval=null,currentTaskId=null,currentReportId=null,currentTarget=null,reportData=null;
 
-    const logLines=['[ SYS ] Connecting to OpenVAS engine...','[ NET ] Loading vulnerability database (176,000+ NVTs)...','[ SYS ] Creating scan target...','[ NET ] Initialising port scanner...','[ SYS ] Launching Full and Fast scan configuration...','[ NET ] Discovering hosts on subnet...','[ SCAN ] Port enumeration in progress...','[ SCAN ] Service fingerprinting active...','[ SCAN ] Running vulnerability tests...','[ SCAN ] Checking CVE database matches...','[ SCAN ] Analysing SSL/TLS configurations...','[ SCAN ] Testing authentication mechanisms...','[ SCAN ] Checking for default credentials...'];
+    const logLines=['[ SYS ] Initialising nmap scanner...','[ NET ] Loading nmap scripts and NSE library...','[ SYS ] Preparing scan target...','[ NET ] Initialising port scanner...','[ SYS ] Launching Full and Fast scan configuration...','[ NET ] Discovering hosts on subnet...','[ SCAN ] Port enumeration in progress...','[ SCAN ] Service fingerprinting active...','[ SCAN ] Running vulnerability tests...','[ SCAN ] Checking CVE database matches...','[ SCAN ] Analysing SSL/TLS configurations...','[ SCAN ] Testing authentication mechanisms...','[ SCAN ] Checking for default credentials...'];
     let logIndex=0;
 
     function addLog(msg,type){
@@ -324,7 +324,7 @@
       }catch(err){clearState();document.getElementById('error-msg').textContent=err.message;show('error')}
     }
 
-    function resumeScan(state){
+    async function resumeScan(state){
       currentTaskId=state.taskId;currentReportId=state.reportId;currentTarget=state.target;reportData=null;
       document.getElementById('scan-target-display').textContent=state.target;
       document.getElementById('progress-fill').style.width='0%';
@@ -332,6 +332,23 @@
       document.getElementById('scan-log').innerHTML='';
       logIndex=6;setPhase('scanning');show('scanning');
       addLog('[ SYS ] Reconnecting to active scan...');
+
+      // Check if scan already completed before starting to poll
+      try {
+        const res=await fetch('/api/status/'+currentTaskId);
+        const data=await res.json();
+        if(data.status==='Done'){
+          // Scan already finished — go straight to AI analysis
+          addLog('[ SYS ] Scan already complete. Running AI analysis...','ai');
+          setPhase('ai');
+          document.getElementById('scan-status-text').textContent='Scan complete — running AI analysis...';
+          await analyseResults();
+          return;
+        }
+      } catch(err){
+        // If status check fails just proceed with normal polling
+      }
+
       addLog('[ SCAN ] Resuming status monitoring...');
       pollStatus();
     }
@@ -342,12 +359,12 @@
         try{
           const res=await fetch('/api/status/'+currentTaskId),data=await res.json();
           const statusText=document.getElementById('scan-status-text'),fill=document.getElementById('progress-fill');
-          if(data.progress>0){fill.style.width=data.progress+'%';statusText.textContent='OpenVAS scanning — '+data.progress+'% complete'}
+          if(data.progress>0){fill.style.width=data.progress+'%';statusText.textContent='Nmap scanning — '+data.progress+'% complete'}
           else{statusText.textContent='Status: '+data.status+' — waiting for progress data...'}
           if(data.status==='Done'){
             clearInterval(pollInterval);clearInterval(logTimer);
             setPhase('ai');
-            statusText.textContent='OpenVAS scan complete — running AI analysis...';
+            statusText.textContent='Nmap scan complete — running AI analysis...';
             addLog('[ AI ] Scan complete. Sending findings to Claude...','ai');
             addLog('[ AI ] Analysing vulnerabilities and attack paths...','ai');
             await analyseResults();
@@ -428,7 +445,7 @@
         '',
         '---',
         '',
-        '*Report generated by [Netscan](https://netscan.uk) — OpenVAS-powered vulnerability scanning with AI analysis.*',
+        '*Report generated by [Netscan](https://netscan.uk) — nmap-powered home network scanning with AI analysis.*',
       ].join('\n');
 
       const blob=new Blob([md],{type:'text/markdown'});

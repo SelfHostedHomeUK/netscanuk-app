@@ -1,5 +1,5 @@
 FROM node:18-alpine
-RUN apk add --no-cache docker-cli
+RUN apk add --no-cache nmap nmap-scripts
 WORKDIR /app
 COPY package*.json ./
 RUN npm install --production

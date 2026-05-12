@@ -1,0 +1,15 @@
+name: netscan
+
+services:
+  netscan:
+    build: ./app
+    container_name: netscan
+    restart: always
+    ports:
+      - "0.0.0.0:3004:3004"
+    env_file:
+      - ./app/.env
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    network_mode: host

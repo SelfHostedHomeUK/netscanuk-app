@@ -3,114 +3,128 @@ const express = require('express');
 const Anthropic = require('@anthropic-ai/sdk');
 const { exec } = require('child_process');
 const { promisify } = require('util');
+const { parseStringPromise } = require('xml2js');
 
 const execAsync = promisify(exec);
 const app = express();
-const PORT = process.env.PORT || 3003;
+const PORT = process.env.PORT || 3004;
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6';
-const GVM_USER = process.env.GVM_USER || 'admin';
-const GVM_PASS = process.env.GVM_PASS || 'admin';
-
-const CONTAINER = 'greenbone-community-edition-gvmd-1';
-const SOCKET = '/run/gvmd/gvmd.sock';
-
-// Known IDs from setup
-const CONFIG_ID   = 'daba56c8-73ec-11df-a475-002264764cea'; // Full and fast
-const SCANNER_ID  = '08b69003-5fc2-4037-a479-93b440211c73'; // OpenVAS Default
-const PORTLIST_ID = '33d0cd82-57c6-11e1-8ed1-406186ea4fc5'; // All IANA TCP
+const MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514';
 
 app.use(express.json());
 app.use(express.static('public'));
 
-// Run a GMP XML command inside the gvmd container
-async function gmp(xml) {
-  const cmd = `docker exec --user gvmd ${CONTAINER} gvm-cli --gmp-username ${GVM_USER} --gmp-password ${GVM_PASS} socket --socketpath ${SOCKET} --xml '${xml}'`;
-  const { stdout } = await execAsync(cmd);
+// In-memory scan store — taskId -> scan state
+const scans = {};
+
+// Generate a simple unique ID
+function uid() {
+  return Math.random().toString(36).slice(2) + Date.now().toString(36);
+}
+
+// ── Run nmap scan ─────────────────────────────────────────────────────────────
+async function runNmap(target) {
+  // -sV  : service/version detection
+  // -sC  : default NSE scripts (covers common misconfigs, SSL, HTTP headers etc)
+  // -O   : OS detection
+  // -p-  : all 65535 ports — use top 1000 for speed: remove -p- and add --top-ports 1000
+  // --script: additional targeted scripts
+  // -oX -: output XML to stdout
+  // Timeout: 5 minutes max per host
+  const nmapArgs = [
+    '-sV',
+    '-sC',
+    '--script=banner,http-methods,http-headers,http-title,ssl-cert,ssl-enum-ciphers,ssh-auth-methods,ftp-anon,smtp-open-relay,dns-recursion,snmp-info,http-robots.txt,http-auth-finder',
+    '--top-ports', '1000',
+    '--host-timeout', '5m',
+    '--open',
+    '-oX', '-',
+    target
+  ].join(' ');
+
+  const cmd = `nmap ${nmapArgs}`;
+  const { stdout } = await execAsync(cmd, { timeout: 360000 }); // 6 min hard timeout
   return stdout;
 }
 
-// Parse a single attribute value from XML string
-function parseAttr(xml, tag, attr) {
-  const re = new RegExp(`<${tag}[^>]*${attr}="([^"]+)"`);
-  const m = xml.match(re);
-  return m ? m[1] : null;
-}
+// ── Parse nmap XML into findings ──────────────────────────────────────────────
+async function parseNmapXml(xml) {
+  const result = await parseStringPromise(xml, { explicitArray: false });
+  const findings = [];
 
-// Parse text content of a tag
-function parseText(xml, tag) {
-  const re = new RegExp(`<${tag}[^>]*>([^<]+)</${tag}>`);
-  const m = xml.match(re);
-  return m ? m[1].trim() : null;
-}
+  const nmaprun = result.nmaprun;
+  if (!nmaprun || !nmaprun.host) return findings;
 
-// Create a scan target
-async function createTarget(hosts) {
-  const name = `netscan-${Date.now()}`;
-  const xml = `<create_target><name>${name}</name><hosts>${hosts}</hosts><port_list id="${PORTLIST_ID}"/><alive_tests>Consider Alive</alive_tests></create_target>`;
-  const res = await gmp(xml);
-  const id = parseAttr(res, 'create_target_response', 'id');
-  if (!id) throw new Error('Failed to create target: ' + res);
-  return id;
-}
+  const hosts = Array.isArray(nmaprun.host) ? nmaprun.host : [nmaprun.host];
 
-// Create a scan task
-async function createTask(targetId) {
-  const name = `netscan-${Date.now()}`;
-  const xml = `<create_task><name>${name}</name><config id="${CONFIG_ID}"/><target id="${targetId}"/><scanner id="${SCANNER_ID}"/></create_task>`;
-  const res = await gmp(xml);
-  const id = parseAttr(res, 'create_task_response', 'id');
-  if (!id) throw new Error('Failed to create task: ' + res);
-  return id;
-}
+  for (const host of hosts) {
+    const ip = host.address?.$ ? host.address.$.addr :
+               (Array.isArray(host.address) ? host.address.find(a => a.$.addrtype === 'ipv4')?.$.addr : 'unknown');
 
-// Start a task
-async function startTask(taskId) {
-  const res = await gmp(`<start_task task_id="${taskId}"/>`);
-  const reportId = parseText(res, 'report_id');
-  if (!reportId) throw new Error('Failed to start task: ' + res);
-  return reportId;
-}
+    const hostname = host.hostnames?.hostname?.$.name || ip;
 
-// Get task status
-async function getTaskStatus(taskId) {
-  const res = await gmp(`<get_tasks task_id="${taskId}"/>`);
-  const statusMatch = res.match(/<status>([^<]+)<\/status>/);
-  const progressMatch = res.match(/<progress>([^<]+)<\/progress>/);
-  return {
-    status: statusMatch ? statusMatch[1] : 'Unknown',
-    progress: progressMatch ? parseInt(progressMatch[1]) : 0,
-  };
-}
+    if (!host.ports?.port) continue;
+    const ports = Array.isArray(host.ports.port) ? host.ports.port : [host.ports.port];
 
-// Get report results
-async function getReport(reportId) {
-  const res = await gmp(`<get_results report_id="${reportId}" filter="min_qod=0 rows=100"/>`);
-  return res;
-}
+    for (const port of ports) {
+      const portNum = port.$.portid;
+      const protocol = port.$.protocol;
+      const state = port.state?.$.state;
 
-// Parse results from XML report
-function parseResults(xml) {
-  const results = [];
-  const resultMatches = xml.matchAll(/<result id="[^"]*">([\s\S]*?)<\/result>/g);
-  for (const match of resultMatches) {
-    const block = match[1];
-    const name = parseText(block, 'name') || 'Unknown';
-    const hostMatch = block.match(/<host>([\s\S]*?)<\/host>/);
-    const host = hostMatch ? hostMatch[1].replace(/<[^>]+>/g, '').trim() : 'Unknown';
-    const port = parseText(block, 'port') || 'N/A';
-    const severity = parseText(block, 'severity') || '0';
-    const descMatch = block.match(/<description>([\s\S]*?)<\/description>/);
-    const description = descMatch ? descMatch[1].trim().substring(0, 500) : '';
-    const solMatch = block.match(/<solution[^>]*>([\s\S]*?)<\/solution>/);
-    const solution = solMatch ? solMatch[1].replace(/<[^>]+>/g, '').trim().substring(0, 300) : '';
-    results.push({ host, port, severity, name, description, solution });
+      if (state !== 'open') continue;
+
+      const service = port.service?.$ || {};
+      const serviceName = service.name || 'unknown';
+      const serviceProduct = service.product || '';
+      const serviceVersion = service.version || '';
+      const serviceExtra = service.extrainfo || '';
+
+      // Collect script output
+      const scriptResults = [];
+      if (port.script) {
+        const scripts = Array.isArray(port.script) ? port.script : [port.script];
+        for (const script of scripts) {
+          scriptResults.push({
+            id: script.$.id,
+            output: script.$.output
+          });
+        }
+      }
+
+      findings.push({
+        host: ip,
+        hostname,
+        port: portNum,
+        protocol,
+        service: serviceName,
+        product: `${serviceProduct} ${serviceVersion} ${serviceExtra}`.trim(),
+        scripts: scriptResults
+      });
+    }
+
+    // OS detection
+    if (host.os?.osmatch) {
+      const osmatches = Array.isArray(host.os.osmatch) ? host.os.osmatch : [host.os.osmatch];
+      const topOs = osmatches[0];
+      if (topOs) {
+        findings.push({
+          host: ip,
+          hostname,
+          port: 'os-detection',
+          protocol: 'general',
+          service: 'OS Detection',
+          product: `${topOs.$.name} (accuracy: ${topOs.$.accuracy}%)`,
+          scripts: []
+        });
+      }
+    }
   }
-  return results;
+
+  return findings;
 }
 
-// Routes
+// ── Routes ────────────────────────────────────────────────────────────────────
 app.get('/about', (req, res) => res.sendFile('about.html', { root: 'public' }));
 app.get('/privacy', (req, res) => res.sendFile('privacy.html', { root: 'public' }));
 
@@ -119,68 +133,101 @@ app.post('/api/scan/start', async (req, res) => {
   const { target } = req.body;
   if (!target) return res.status(400).json({ error: 'Target IP or range required.' });
 
-  try {
-    const targetId = await createTarget(target);
-    const taskId = await createTask(targetId);
-    const reportId = await startTask(taskId);
-    res.json({ taskId, reportId, message: 'Scan started.' });
-  } catch (err) {
-    console.error('Scan start error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+  const taskId = uid();
+  const reportId = uid();
+
+  scans[taskId] = {
+    status: 'Running',
+    progress: 0,
+    reportId,
+    target,
+    findings: null,
+    error: null,
+    startTime: Date.now()
+  };
+
+  // Run scan asynchronously
+  (async () => {
+    try {
+      scans[taskId].progress = 10;
+      const xml = await runNmap(target);
+      scans[taskId].progress = 80;
+      const findings = await parseNmapXml(xml);
+      scans[taskId].findings = findings;
+      scans[taskId].progress = 100;
+      scans[taskId].status = 'Done';
+    } catch (err) {
+      console.error('Scan error:', err.message);
+      scans[taskId].status = 'Failed';
+      scans[taskId].error = err.message;
+    }
+  })();
+
+  res.json({ taskId, reportId, message: 'Scan started.' });
 });
 
-// Poll scan status
-app.get('/api/status/:taskId', async (req, res) => {
-  try {
-    const status = await getTaskStatus(req.params.taskId);
-    res.json(status);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+// Poll status
+app.get('/api/status/:taskId', (req, res) => {
+  const scan = scans[req.params.taskId];
+  if (!scan) return res.status(404).json({ error: 'Scan not found.' });
+  res.json({ status: scan.status, progress: scan.progress });
 });
 
-// Get and analyse results
+// Analyse results
 app.post('/api/analyse', async (req, res) => {
   const { reportId } = req.body;
   if (!reportId) return res.status(400).json({ error: 'Report ID required.' });
 
+  // Find scan by reportId
+  const scan = Object.values(scans).find(s => s.reportId === reportId);
+  if (!scan) return res.status(404).json({ error: 'Report not found.' });
+  if (scan.status !== 'Done') return res.status(400).json({ error: 'Scan not complete.' });
+
+  const findings = scan.findings || [];
+
+  if (!findings.length) {
+    return res.json({
+      executive: 'No open ports or services were detected on the target.',
+      technical: 'The scan completed without finding any open ports or running services.',
+      attackPath: 'No attack surface identified.',
+      remediation: 'Confirm the target is reachable and the correct IP was used.',
+      nextAction: 'Verify connectivity and re-scan.',
+      resultCount: 0
+    });
+  }
+
   try {
-    const xml = await getReport(reportId);
-    const results = parseResults(xml);
-
-    if (!results.length) {
-      return res.json({
-        executive: 'No significant vulnerabilities were detected on this network.',
-        technical: 'The scan completed without finding vulnerabilities above the minimum quality of detection threshold.',
-        attackPath: 'No clear attack path identified.',
-        remediation: 'Continue regular scanning to monitor for changes.',
-        nextAction: 'Schedule a follow-up scan in 30 days.',
-        resultCount: 0
-      });
-    }
-
-    // Sort by severity descending
-    results.sort((a, b) => parseFloat(b.severity) - parseFloat(a.severity));
-
     const message = await client.messages.create({
       model: MODEL,
       max_tokens: 8192,
       messages: [{
         role: 'user',
-        content: `You are a senior network security analyst with 20 years of experience in enterprise IT security. You have received OpenVAS vulnerability scan results for a network.
+        content: `You are a senior home network security analyst. You have received nmap scan results for a home/self-hosted network.
+
+The target is a home network device — a Raspberry Pi, home server, NAS, or similar. Focus on practical home network security risks, not enterprise concerns.
+
+Key things to look for:
+- Services exposed that shouldn't be (admin interfaces, databases, dev servers)
+- Default credentials indicators
+- Unencrypted services (HTTP instead of HTTPS, FTP, Telnet)
+- Outdated software versions with known CVEs
+- SSH configuration weaknesses
+- Open ports that suggest accidental internet exposure
+- Docker ports exposed on 0.0.0.0 unnecessarily
+- Development mode indicators (Node.js, etc)
+- SSL/TLS certificate issues
 
 Analyse these results and respond ONLY with a JSON object in this exact format, no preamble, no markdown:
 {
-  "executive": "2-3 sentences in plain English for a non-technical board audience — overall risk level and what it means for the business",
-  "technical": "Prioritised technical breakdown grouped by severity (Critical/High/Medium/Low). For each significant finding explain what it is, why it matters, and the attack vector. Use clear paragraphs.",
-  "attackPath": "The most likely attack path an adversary would take to compromise this network based on the findings. Be specific.",
-  "remediation": "Prioritised remediation actions in order of importance. Include effort estimate: Quick Win / Medium Effort / Significant Effort for each.",
+  "executive": "2-3 sentences in plain English — overall risk level and what it means for a home user",
+  "technical": "Prioritised technical breakdown. For each significant finding explain what it is, why it matters for a home network, and what the risk is. Use clear paragraphs grouped by severity.",
+  "attackPath": "The most likely way someone could abuse what was found. Keep it practical and home-network relevant.",
+  "remediation": "Prioritised fixes in order of importance with effort estimates: Quick Win / Medium Effort / Significant Effort.",
   "nextAction": "The single most important thing to fix right now, in one sentence."
 }
 
-Scan results (${results.length} findings):
-${JSON.stringify(results.slice(0, 60), null, 2)}`
+Scan results (${findings.length} open ports/services found):
+${JSON.stringify(findings, null, 2)}`
       }]
     });
 
@@ -199,7 +246,7 @@ ${JSON.stringify(results.slice(0, 60), null, 2)}`
       };
     }
 
-    res.json({ ...parsed, resultCount: results.length });
+    res.json({ ...parsed, resultCount: findings.length });
 
   } catch (err) {
     console.error('Analysis error:', err.message);
@@ -207,46 +254,49 @@ ${JSON.stringify(results.slice(0, 60), null, 2)}`
   }
 });
 
-
 // Generate remediation script
 app.post('/api/remediation', async (req, res) => {
   const { reportId } = req.body;
   if (!reportId) return res.status(400).json({ error: 'Report ID required.' });
 
+  const scan = Object.values(scans).find(s => s.reportId === reportId);
+  if (!scan) return res.status(404).json({ error: 'Report not found.' });
+  if (scan.status !== 'Done') return res.status(400).json({ error: 'Scan not complete.' });
+
+  const findings = scan.findings || [];
+
+  if (!findings.length) {
+    return res.json({ script: '#!/bin/bash\n# No findings to remediate.\necho "No remediation required."' });
+  }
+
   try {
-    const xml = await gmp(`<get_results report_id="${reportId}" filter="min_qod=0 rows=100"/>`);
-    const results = parseResults(xml);
-
-    if (!results.length) {
-      return res.json({ script: '#!/bin/bash\n# No significant findings to remediate.\necho "No remediation required."' });
-    }
-
-    results.sort((a, b) => parseFloat(b.severity) - parseFloat(a.severity));
-
     const message = await client.messages.create({
       model: MODEL,
       max_tokens: 4096,
       messages: [{
         role: 'user',
-        content: `You are a senior Linux security engineer. Based on these OpenVAS vulnerability scan results, generate a bash remediation script.
+        content: `You are a senior Linux security engineer working with home network/self-hosted setups.
+
+Based on these nmap scan results, generate a bash remediation script for a home user running Ubuntu/Raspberry Pi OS.
 
 Rules:
 - Output ONLY a valid bash script, no preamble, no markdown, no backticks
 - Start with #!/bin/bash
-- Include a clear comment header with date, target info, and a WARNING that the script should be reviewed before running
-- Add a comment before each command explaining what it does and why
-- Group commands by severity: CRITICAL/HIGH first, then MEDIUM, then LOW
-- Only include commands that are safe, non-destructive, and commonly available on Ubuntu/Debian
-- For each fix include a verification command commented out with # VERIFY:
-- End with an echo summary of what was done
-- If a fix requires manual intervention, add a comment explaining what to do instead of a command
+- Include a header with date and WARNING to review before running
+- Add a comment before each command explaining what it does
+- Group by severity: HIGH first, then MEDIUM, then LOW
+- Only include safe, non-destructive commands
+- Include # VERIFY: lines after each fix
+- For Docker-specific fixes, include docker compose restart instructions
+- End with an echo summary
+- If fix requires manual intervention add a clear comment instead of a command
 
-Scan results (${results.length} findings):
-${JSON.stringify(results.slice(0, 60), null, 2)}`
+Scan results:
+${JSON.stringify(findings, null, 2)}`
       }]
     });
 
-    const script = message.content[0].text.replace(/\`\`\`bash|\`\`\`/g, '').trim();
+    const script = message.content[0].text.replace(/```bash|```/g, '').trim();
     res.json({ script });
 
   } catch (err) {
