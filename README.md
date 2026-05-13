@@ -1,3 +1,4 @@
+![Netscan — Scan. Analyse. Understand.](docs/netscan-header.jpg)
 # Netscan
 
 **Home network security scanning with nmap and AI-powered analysis.**
