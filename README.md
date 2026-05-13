@@ -114,9 +114,14 @@ The XML output is parsed into a structured findings array and sent to Claude wit
 
 ---
 
-## Security note
+## Legal
 
-Only scan networks and devices you own or have explicit written permission to scan. Unauthorised scanning may be illegal in your jurisdiction.
+Netscan is provided for use on networks and systems you own or have explicit 
+written permission to scan. Unauthorised scanning may be illegal in your 
+jurisdiction. This tool is provided as-is with no warranty of any kind. 
+The authors, contributors, and Self Hosted Home UK accept no liability for 
+any damages, data loss, legal consequences, or misuse arising from its use. 
+Use entirely at your own risk.
 
 ---
 
